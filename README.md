@@ -8,7 +8,9 @@
 * **大規模數據壓測**：針對 5.6 GB 數據量進行循環計算驗證，確保在極端負載下的穩定性。
 
 ## 🚀 性能實測 (Benchmark)
-測試環境：NVIDIA GeForce RTX 4060
+測試環境：
+GPU : NVIDIA GeForce RTX 4060
+CPU : I5 12400F
 
 | 數據規模 | 迭代次數 (Iterations) | 加速比 (vs CPU/Sync) | 數據校驗 (Validation) |
 | :--- | :--- | :--- | :--- |
@@ -18,12 +20,15 @@
 > **技術觀察**：隨著迭代次數增加，GPU 的吞吐量優勢（Throughput）呈線性爆發，成功抵銷了 PCIe 頻寬帶來的初始延遲。
 
 ## 🛠️ 開發環境
-- **Language**: C++ 20
+- **Language**: C++ 23
 - **Graphics API**: DirectX 12 (Agility SDK)
 - **Shader**: HLSL (CS_6_0)
-- **IDE**: Visual Studio 2022 (.slnx ready)
+- **IDE**: Visual Studio 2026 (.slnx ready)
 
 ## 📂 專案結構
 - `API/main.cpp`: 測試邏輯與高精度計時器實作。
 - `API/GPU.cpp`: DX12 核心架構、指令列表管理與異步同步邏輯。
 - `API/SuperCompute.hlsl`: 最佳化的 GPGPU 計算核心。
+
+## 其他&已知問題
+* **Demo版本是AI生成的雛形日後會針對此版本錯修改和新增
