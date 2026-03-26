@@ -9,8 +9,8 @@
 
 ## 🚀 性能實測 (Benchmark)
 測試環境：
-GPU : NVIDIA GeForce RTX 4060
-CPU : I5 12400F
+* GPU : NVIDIA GeForce RTX 4060
+* CPU : I5 12400F
 
 | 數據規模 | 迭代次數 (Iterations) | 加速比 (vs CPU/Sync) | 數據校驗 (Validation) |
 | :--- | :--- | :--- | :--- |
