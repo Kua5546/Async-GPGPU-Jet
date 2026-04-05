@@ -1,0 +1,16 @@
+# 編譯產物
+*.obj
+*.exe
+*.dll
+*.lib
+*.pdb
+*.exp
+
+# Visual Studio 暫存
+.vs/
+out/
+build/
+x64/
+
+# Shader 編譯產物
+*.spv
