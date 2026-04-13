@@ -1,19 +1,22 @@
 #pragma once
 
-// 根據編譯環境自動切換 導出 (Export) 或 導入 (Import)
-#ifdef GPU_EXPORTS
-#define GPU_API __declspec(dllexport)
-#else
-#define GPU_API __declspec(dllimport)
-#endif
-
 #include <expected>
 #include <vector>
 #include <cstdint>
+#include <string>    // 補上這個，修復識別項 "string" 未定義
+#include <iostream>  // 補上這個，修復 cerr, endl 未定義
+#include <vulkan/vulkan.h>
 
-/**
- * @brief 錯誤代碼定義
- */
+#ifdef _WIN32
+    #ifdef GPU_EXPORTS
+        #define GPU_API __declspec(dllexport)
+    #else
+        #define GPU_API __declspec(dllimport)
+    #endif
+#else
+    #define GPU_API __attribute__((visibility("default")))
+#endif
+
 enum class gpu_error {
     Success = 0,
     DeviceCreationFailed = 5546,
@@ -23,6 +26,34 @@ enum class gpu_error {
     ResourceCreationFailed = 5551,
     DestroyBufferFailed = 5552,
 };
+
+enum class _size
+{
+    U128 = 128u,
+    U64 = 64u,
+};
+
+extern "C" {
+    // 1. 生命週期管理
+    GPU_API void* CreateGPUInstance(); // 回傳一個指標給 Java 存著
+    GPU_API void  DestroyGPUInstance(void* handle);
+
+    // 2. 初始化與配置
+    GPU_API int   InitGPU(void* handle, size_t bridgeSize);
+    GPU_API int   ResizeBridge(void* handle, size_t newSize);
+
+    // 3. 運算與調度
+    // 你可以把 ComputeConstants 拆開傳入，或傳入一個結構指標
+    GPU_API int   DispatchTask(void* handle, int taskId, uint32_t dataSize, float p1, float p2);
+
+    // 4. 資料交換
+    GPU_API void* GetUploadHeapPtr(void* handle);
+    GPU_API void* GetReadbackHeapPtr(void* handle);
+}
+
+/**
+ * @brief 錯誤代碼定義
+ */
 
 enum class mod {
     GRAPHICS,
@@ -103,7 +134,7 @@ public:
      * @param configs 運算常數 (對應 HLSL 的 push_constant)
      * @param targetPipeline 可選：傳入特定的 Pipeline 以切換演算法
      */
-    void RecordCompute(const ComputeConstants& configs, VkPipeline targetPipeline = nullptr);
+    void RecordCompute(const ComputeConstants& configs, _size u_size, VkPipeline targetPipeline = nullptr);
 
     /**
      * @brief 重置指令清單，準備下一次錄製

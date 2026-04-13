@@ -2,13 +2,18 @@
 #define VMA_IMPLEMENTATION    // 僅在實作檔定義一次
 
 // 1. 先處理第三方庫的警告屏蔽
+#ifdef _WIN32
 #pragma warning(push)
-#pragma warning(disable: 26495) 
-#pragma warning(disable: 26451) 
-#pragma warning(disable: 6386)  
-#pragma warning(disable: 28182) 
-#include "VulkanMemoryAllocator-3.3.0\include\vk_mem_alloc.h"
+#pragma warning(disable : 4251) 
+#include "VulkanMemoryAllocator-3.3.0/include/vk_mem_alloc.h"
 #pragma warning(pop)
+#else
+    // Linux/GCC 屏蔽警告的方式
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-variable" 
+#include "VulkanMemoryAllocator-3.3.0/include/vk_mem_alloc.h"
+#pragma GCC diagnostic pop
+#endif
 
 // 2. 引入自己的標頭檔
 #include "GPU.hpp"
@@ -21,6 +26,15 @@
 #include <algorithm> 
 #include <vulkan/vulkan.h>
 
+#ifndef VK_API_VERSION_1_4
+#define VK_API_VERSION_1_4 VK_MAKE_API_VERSION(0, 1, 4, 0)
+#endif
+
+#ifndef VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES (VkStructureType)1000540000
+
+#endif
+
 struct GPU::Impl {
     VkInstance       m_instance = VK_NULL_HANDLE;
     VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
@@ -31,9 +45,12 @@ struct GPU::Impl {
     VkQueue          m_computeQueue = VK_NULL_HANDLE;
     VkQueue          m_copyQueue = VK_NULL_HANDLE;
     VkCommandPool    m_computePool = VK_NULL_HANDLE;
+    VkCommandPool    m_copyPool = VK_NULL_HANDLE;
     VkCommandBuffer  m_computeCmd = VK_NULL_HANDLE;
+    VkCommandBuffer  m_copyCmd = VK_NULL_HANDLE; // 專門錄製搬運指令
 
     uint32_t         m_computeIdx = 0;
+    uint32_t         m_graphicsIdx = 0;
     uint32_t         m_copyIdx = 0;
 
     VkSemaphore      m_computeSemaphore = VK_NULL_HANDLE;
@@ -53,10 +70,12 @@ struct GPU::Impl {
 
     std::mutex m_submitMutex;
 
-    bool m_isLocked;
+    bool m_isLocked = false;
 };
 
-GPU::GPU() : pImpl(new Impl()) {}
+GPU::GPU() : pImpl(new Impl()) {
+    pImpl->m_isLocked = false;
+}
 
 GPU::~GPU() {
     ReleaseResources();
@@ -212,6 +231,36 @@ auto GPU::PickDevice(bool cpu_GPU, mod _mod) -> std::expected<void, gpu_error> {
             break;
         case mod::BOTH:
             // MORE
+            //GRAPHICS
+            for (uint32_t i = 0; i < qCount; i++) {
+                if (qProps[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+                    pImpl->m_graphicsIdx = i;
+                    break;
+                }
+            }
+            //COMPUTE
+            for (uint32_t i = 0; i < qCount; i++) {
+                if (qProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+                    pImpl->m_computeIdx = i;
+                    break;
+                }
+            }
+
+            // 3. 如果沒找到獨立計算隊列，才退而求其次用同一個
+            if (pImpl->m_computeIdx == uint32_t(-1)) {
+                pImpl->m_computeIdx = pImpl->m_graphicsIdx;
+            }
+
+            for (uint32_t i = 0; i < qCount; i++) {
+                auto flags = qProps[i].queueFlags;
+                if ((flags & VK_QUEUE_TRANSFER_BIT) &&
+                    !(flags & VK_QUEUE_GRAPHICS_BIT) &&
+                    !(flags & VK_QUEUE_COMPUTE_BIT)) {
+                    pImpl->m_copyIdx = i;
+                    break;
+                }
+            }
+
             break;
     }
 
@@ -234,7 +283,7 @@ auto GPU::CreateLogicalDevice() -> std::expected<void, gpu_error> {
     // 1. 設定 Queue 請求 - 簡化邏輯，每個家族只請 1 個
     float queuePriority = 1.0f;
     std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
-    std::set<uint32_t> uniqueQueueFamilies = { pImpl->m_computeIdx, pImpl->m_copyIdx };
+    std::set<uint32_t> uniqueQueueFamilies = { pImpl->m_graphicsIdx, pImpl->m_computeIdx, pImpl->m_copyIdx };
 
     for (uint32_t index : uniqueQueueFamilies) {
         if (index == uint32_t(-1)) continue;
@@ -301,6 +350,15 @@ auto GPU::CreateLogicalDevice() -> std::expected<void, gpu_error> {
     if (vkAllocateCommandBuffers(pImpl->m_device, &allocInfo, &pImpl->m_computeCmd) != VK_SUCCESS) {
         return std::unexpected(gpu_error::QueueCreationFailed);
     }
+
+    poolInfo.queueFamilyIndex = pImpl->m_copyIdx;
+    vkCreateCommandPool(pImpl->m_device, &poolInfo, nullptr, &pImpl->m_copyPool);
+
+    VkCommandBufferAllocateInfo copyAlloc{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    copyAlloc.commandPool = pImpl->m_copyPool;
+    copyAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    copyAlloc.commandBufferCount = 1;
+    vkAllocateCommandBuffers(pImpl->m_device, &copyAlloc, &pImpl->m_copyCmd);
 
     return {};
 }
@@ -388,7 +446,26 @@ VulkanBuffer GPU::CreateBuffer(size_t size, uint32_t usage, int vmaUsage) {
     VkBufferCreateInfo bufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     bufferInfo.size = size;
     bufferInfo.usage = (VkBufferUsageFlags)usage;
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    // --- 關鍵修正區 ---
+    uint32_t families[] = { pImpl->m_graphicsIdx, pImpl->m_computeIdx, pImpl->m_copyIdx };
+    std::set<uint32_t> uniqueIndices;
+
+    // 過濾掉重複的 Index 與無效值 (-1)
+    for (auto idx : families) {
+        if (idx != uint32_t(-1)) uniqueIndices.insert(idx);
+    }
+
+    std::vector<uint32_t> familyList(uniqueIndices.begin(), uniqueIndices.end());
+    if (pImpl->m_computeIdx != pImpl->m_graphicsIdx) 
+    {
+        bufferInfo.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        bufferInfo.queueFamilyIndexCount = (uint32_t)familyList.size();
+        bufferInfo.pQueueFamilyIndices = familyList.data();
+    }
+    else
+    {
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    }
 
     VmaAllocationCreateInfo allocInfo = {};
     allocInfo.usage = (VmaMemoryUsage)vmaUsage;
@@ -420,81 +497,73 @@ VulkanBuffer GPU::CreateBuffer(size_t size, uint32_t usage, int vmaUsage) {
     return vBuffer;
 }
 
-void GPU::RecordCompute(const ComputeConstants& configs, VkPipeline targetPipeline) {
-    // 如果沒傳入特定的 Pipeline，就用初始化時預設的那一個
+void GPU::RecordCompute(const ComputeConstants& configs, _size u_size, VkPipeline targetPipeline) {
     VkPipeline pipeline = (targetPipeline != VK_NULL_HANDLE) ? targetPipeline : pImpl->m_computePipeline;
+    if (pipeline == VK_NULL_HANDLE || pImpl->m_computeCmd == VK_NULL_HANDLE || pImpl->m_copyCmd == VK_NULL_HANDLE) return;
 
-    if (pImpl->m_computeCmd == VK_NULL_HANDLE || pipeline == VK_NULL_HANDLE) return;
-
-    VkCommandBufferBeginInfo beginInfo{ .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
-    vkBeginCommandBuffer(pImpl->m_computeCmd, &beginInfo);
-
-    // --- 1. 上傳：Host -> VRAM ---
-    VkBufferCopy uploadRegion{
-            .srcOffset = 0,
-            .dstOffset = 0,
-            .size = (VkDeviceSize)configs.currentChunkSize // 這裡原本是 .size
+    // --- 0. 先定義共用的搬運範圍 (解決未定義問題) ---
+    VkBufferCopy region{
+        .srcOffset = 0,
+        .dstOffset = 0,
+        .size = (VkDeviceSize)configs.currentChunkSize
     };
 
-    vkCmdCopyBuffer(pImpl->m_computeCmd, (VkBuffer)pImpl->m_uploadHeap.internalBuffer,
-        (VkBuffer)pImpl->m_vramTemp.internalBuffer, 1, &uploadRegion);
+    // --- 1. 錄製 Copy 指令 (Host -> VRAM) ---
+    VkCommandBufferBeginInfo beginCopy{ .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkBeginCommandBuffer(pImpl->m_copyCmd, &beginCopy);
 
-    // --- 2. 屏障：轉至 Compute 階段 ---
+    vkCmdCopyBuffer(pImpl->m_copyCmd, (VkBuffer)pImpl->m_uploadHeap.internalBuffer, (VkBuffer)pImpl->m_vramTemp.internalBuffer, 1, &region);
+
+    vkEndCommandBuffer(pImpl->m_copyCmd);
+
+    // --- 2. 錄製 Compute 指令 ---
+    VkCommandBufferBeginInfo beginCompute{ .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkBeginCommandBuffer(pImpl->m_computeCmd, &beginCompute);
+
+    // Barrier 1: 確保 Copy 隊列寫入完成，Compute 才能讀取
     VkBufferMemoryBarrier2 barrier1{
         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
-        .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+        .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, // 來源是搬運
         .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, // 目的是運算
         .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
         .buffer = (VkBuffer)pImpl->m_vramTemp.internalBuffer,
         .offset = 0,
-        .size = (VkDeviceSize)configs.currentChunkSize // 這裡原本是 .size
+        .size = region.size
     };
     VkDependencyInfo dep1{ .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &barrier1 };
     vkCmdPipelineBarrier2(pImpl->m_computeCmd, &dep1);
 
-    // --- 3. 執行運算 (核心擴充點) ---
+    // 綁定與執行
     vkCmdBindPipeline(pImpl->m_computeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
 
-    // 動態綁定當前的 VRAM Buffer
     VkDescriptorBufferInfo bInfo{ (VkBuffer)pImpl->m_vramTemp.internalBuffer, 0, VK_WHOLE_SIZE };
-    VkWriteDescriptorSet write{ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1,
-                                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bInfo };
-
+    VkWriteDescriptorSet write{
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstBinding = 0,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .pBufferInfo = &bInfo
+    };
     vkCmdPushDescriptorSet(pImpl->m_computeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, pImpl->m_pipelineLayout, 0, 1, &write);
-
-    // 推送通用常數 (HLSL 端的 cbuffer 需與此結構對齊)
     vkCmdPushConstants(pImpl->m_computeCmd, pImpl->m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ComputeConstants), &configs);
 
-    // 自動計算 Dispatch 大小 (假設 4-byte 元素與 64 執行緒組)
-    const uint32_t bytesPerElement = sizeof(uint32_t);
-
-    // 1. 計算總元素量（確保不足 4 bytes 的部分也被算入一個完整的 uint）
-    uint32_t threadCount = AlignUp((uint32_t)configs.currentChunkSize, bytesPerElement) / bytesPerElement;
-
-    // 2. 計算工作群組數量（對齊 64 執行緒）
-    uint32_t groupCount = AlignUp(threadCount, 64u) / 64u;
-
+    uint32_t threadCount = AlignUp((uint32_t)configs.currentChunkSize, 4u) / 4u;
+    uint32_t groupCount = AlignUp(threadCount, (uint32_t)u_size) / (uint32_t)u_size;
     vkCmdDispatch(pImpl->m_computeCmd, groupCount, 1, 1);
 
-    // --- 4. 屏障：轉至 Download 階段 ---
-    VkBufferMemoryBarrier2 barrier2 = barrier1; // 複製基礎設定
-    barrier2.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    // Barrier 2: 確保運算寫入完成，才能進行下載搬運
+    VkBufferMemoryBarrier2 barrier2 = barrier1;
+    barrier2.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT; // 來源變回運算
     barrier2.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
-    barrier2.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    barrier2.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;          // 目的是搬運
     barrier2.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
 
     VkDependencyInfo dep2{ .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &barrier2 };
     vkCmdPipelineBarrier2(pImpl->m_computeCmd, &dep2);
 
-    // --- 5. 下載：VRAM -> Readback ---
-    VkBufferCopy downloadRegion{
-            .srcOffset = 0,
-            .dstOffset = 0,
-            .size = (VkDeviceSize)configs.currentChunkSize // 這裡原本是 .size
-    };
-    vkCmdCopyBuffer(pImpl->m_computeCmd, (VkBuffer)pImpl->m_vramTemp.internalBuffer,
-        (VkBuffer)pImpl->m_readbackHeap.internalBuffer, 1, &downloadRegion);
+    // --- 3. 下載：VRAM -> Readback ---
+    vkCmdCopyBuffer(pImpl->m_computeCmd, (VkBuffer)pImpl->m_vramTemp.internalBuffer, (VkBuffer)pImpl->m_readbackHeap.internalBuffer, 1, &region);
 
     vkEndCommandBuffer(pImpl->m_computeCmd);
 }
@@ -502,22 +571,34 @@ void GPU::RecordCompute(const ComputeConstants& configs, VkPipeline targetPipeli
 void GPU::ResetCommandList() { vkResetCommandBuffer(pImpl->m_computeCmd, 0); }
 
 auto GPU::BuildComputePipeline(const std::vector<uint32_t>& spirvCode) -> std::expected<void, gpu_error> {
+    if (spirvCode.empty()) return std::unexpected(gpu_error::ResourceCreationFailed);
+
+    // 1. 如果之前已經有 Pipeline，先銷毀它，防止記憶體洩漏 (Resize 或換算法時會用到)
+    if (pImpl->m_computePipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(pImpl->m_device, pImpl->m_computePipeline, nullptr);
+        pImpl->m_computePipeline = VK_NULL_HANDLE;
+    }
+
     VkShaderModule computeModule = CreateShaderModule(spirvCode);
     if (computeModule == VK_NULL_HANDLE) return std::unexpected(gpu_error::ResourceCreationFailed);
 
     VkPipelineShaderStageCreateInfo stageInfo{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
     stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     stageInfo.module = computeModule;
-    stageInfo.pName = "main";
+    stageInfo.pName = "main"; // 提醒使用者：Shader 的進入點必須叫 main
 
     VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
     pipelineInfo.layout = pImpl->m_pipelineLayout;
     pipelineInfo.stage = stageInfo;
 
     VkResult res = vkCreateComputePipelines(pImpl->m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pImpl->m_computePipeline);
+
+    // Module 用完立刻銷毀，不影響 Pipeline 運行
     vkDestroyShaderModule(pImpl->m_device, computeModule, nullptr);
 
     if (res != VK_SUCCESS) return std::unexpected(gpu_error::ResourceCreationFailed);
+
+    std::println("Compute Pipeline 建立成功！");
     return {};
 }
 
@@ -529,50 +610,45 @@ auto GPU::CreateShaderModule(const std::vector<uint32_t>& code) -> VkShaderModul
 }
 
 uint64_t GPU::ExecuteAndSignal() {
-    // 1. 使用 Mutex 保護，防止多執行緒同時 Submit 導致指令順序混亂
     std::lock_guard<std::mutex> lock(pImpl->m_submitMutex);
 
-    // 2. 遞增 Timeline 數值
-    // 這個數值代表「當這組指令跑完時，Semaphore 會達到的目標值」
+    pImpl->m_copyValue++;
     pImpl->m_computeValue++;
 
-    // 必須使用成員變數的位址，因為它的生命週期與 GPU 實例綁定
-    // 在 vkQueueSubmit 執行時，Vulkan 會讀取該位址當下的數值
-    uint64_t* pSignalValue = &pImpl->m_computeValue;
+    // 1. 提交到 Copy Queue (搬運)
+    VkTimelineSemaphoreSubmitInfo copyTimeline{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, nullptr, 0, nullptr, 1, &pImpl->m_copyValue };
+    VkSubmitInfo copySubmit{
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .pNext = &copyTimeline,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &pImpl->m_copyCmd,
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = &pImpl->m_copySemaphore
+    };
+    vkQueueSubmit(pImpl->m_copyQueue, 1, &copySubmit, VK_NULL_HANDLE);
 
-    // 3. 設定 Timeline Semaphore 的提交資訊
-    VkTimelineSemaphoreSubmitInfo timelineInfo{
-        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
-        .pNext = nullptr,
-        .waitSemaphoreValueCount = 0,      // 目前沒有要等別的任務
-        .pWaitSemaphoreValues = nullptr,
-        .signalSemaphoreValueCount = 1,    // 完工時要發出 1 個訊號
-        .pSignalSemaphoreValues = pSignalValue
+    // 2. 提交到 Compute Queue (運算)
+    // 關鍵：這步會讓 GPU 在硬體上等待 Copy 完成才開始計算，不卡 CPU
+    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    VkTimelineSemaphoreSubmitInfo computeTimeline{
+        VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, nullptr,
+        1, &pImpl->m_copyValue,    // Wait: 等待搬運完成的數值
+        1, &pImpl->m_computeValue // Signal: 完成運算的數值
     };
 
-    // 4. 標準提交資訊
-    VkSubmitInfo submitInfo{
+    VkSubmitInfo computeSubmit{
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .pNext = &timelineInfo,            // 串聯 Timeline 特性
-        .waitSemaphoreCount = 0,
-        .pWaitSemaphores = nullptr,
-        .pWaitDstStageMask = nullptr,
+        .pNext = &computeTimeline,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &pImpl->m_copySemaphore,
+        .pWaitDstStageMask = &waitStage,
         .commandBufferCount = 1,
         .pCommandBuffers = &pImpl->m_computeCmd,
         .signalSemaphoreCount = 1,
         .pSignalSemaphores = &pImpl->m_computeSemaphore
     };
+    vkQueueSubmit(pImpl->m_computeQueue, 1, &computeSubmit, VK_NULL_HANDLE);
 
-    // 5. 提交至計算隊列
-    // 注意：最後一個參數 (Fence) 傳入 VK_NULL_HANDLE，因為我們已經用 Timeline Semaphore 代替了
-    VkResult res = vkQueueSubmit(pImpl->m_computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
-
-    if (res != VK_SUCCESS) {
-        std::println("Error: Failed to submit compute queue! Result: {}", (int)res);
-        return 0;
-    }
-
-    // 6. 回傳當前的任務序號，讓呼叫者知道要 Wait(target) 哪一個值
     return pImpl->m_computeValue;
 }
 

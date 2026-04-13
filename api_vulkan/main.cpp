@@ -106,7 +106,7 @@ int main() {
                 .params = { iters, 0xABCDEFAF }
             };
             gpu.ResetCommandList();
-            gpu.RecordCompute(config);
+            gpu.RecordCompute(config,_size::U64);
             gpu.Wait(gpu.ExecuteAndSignal());
 
             // C. 深度驗證
@@ -153,7 +153,7 @@ int main() {
         // 驗證 Resize 後的 Buffer 是否真的可用
         ComputeConstants finalConfig{ .dataOffset = 0, .currentChunkSize = 512 * 1024 * 1024, .params = { 64, 0xABCDEFAF } };
         gpu.ResetCommandList();
-        gpu.RecordCompute(finalConfig);
+        gpu.RecordCompute(finalConfig,_size::U64);
         gpu.Wait(gpu.ExecuteAndSignal());
         cout << "[+] Resize 後 512MB 壓力測試：正常。" << endl;
     }
